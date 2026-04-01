@@ -28,6 +28,8 @@ import {
   ListAllInboxesInputSchema,
   GetOrganizationInputSchema,
   ListOrganizationsInputSchema,
+  CreateNoteInputSchema,
+  UpdateConversationTagsInputSchema,
   GetOrganizationMembersInputSchema,
   GetOrganizationConversationsInputSchema,
 } from '../schema/types.js';
@@ -82,6 +84,13 @@ export class ToolHandler {
    * Escape special characters in Help Scout query syntax to prevent injection
    * Help Scout uses double quotes for exact phrases, so we need to escape them
    */
+  private parseCursorToPage(cursor?: string): number {
+    if (!cursor) return 1;
+    const page = parseInt(cursor, 10);
+    if (isNaN(page) || page < 1) return 1;
+    return page;
+  }
+
   private escapeQueryTerm(term: string): string {
     // Escape backslashes first, then double quotes
     return term.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -334,6 +343,10 @@ export class ToolHandler {
               maximum: TOOL_CONSTANTS.MAX_PAGE_SIZE,
               default: TOOL_CONSTANTS.DEFAULT_PAGE_SIZE,
             },
+            cursor: {
+              type: 'string',
+              description: 'Pagination cursor for next page',
+            },
           },
         },
       },
@@ -530,6 +543,43 @@ export class ToolHandler {
           required: ['organizationId'],
         },
       },
+      {
+        name: 'createNote',
+        description: 'Add an internal note to a conversation. Notes are only visible to Help Scout agents, not customers.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            conversationId: {
+              type: 'string',
+              description: 'The conversation ID to add the note to',
+            },
+            text: {
+              type: 'string',
+              description: 'The note text content (supports HTML)',
+            },
+          },
+          required: ['conversationId', 'text'],
+        },
+      },
+      {
+        name: 'updateConversationTags',
+        description: 'Replace ALL tags on a conversation. This is a full replacement — any existing tags not included in the array will be removed. To ADD tags without removing existing ones, first retrieve the conversation to get current tags, then include both old and new tags in the array.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            conversationId: {
+              type: 'string',
+              description: 'The conversation ID to update tags on',
+            },
+            tags: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Complete list of tags for the conversation. WARNING: This replaces all existing tags. To add a tag, include all current tags plus the new one. To remove a tag, include all tags except the one to remove.',
+            },
+          },
+          required: ['conversationId', 'tags'],
+        },
+      },
     ];
   }
 
@@ -639,6 +689,12 @@ export class ToolHandler {
         case 'getOrganizationConversations':
           result = await this.getOrganizationConversations(request.params.arguments || {});
           break;
+        case 'createNote':
+          result = await this.createNote(request.params.arguments || {});
+          break;
+        case 'updateConversationTags':
+          result = await this.updateConversationTags(request.params.arguments || {});
+          break;
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
       }
@@ -696,7 +752,7 @@ export class ToolHandler {
   private async searchInboxes(args: unknown): Promise<CallToolResult> {
     const input = SearchInboxesInputSchema.parse(args);
     const response = await helpScoutClient.get<PaginatedResponse<Inbox>>('/mailboxes', {
-      page: 1,
+      page: this.parseCursorToPage(input.cursor),
       size: input.limit,
     });
 
@@ -736,7 +792,7 @@ export class ToolHandler {
     const input = SearchConversationsInputSchema.parse(args);
 
     const baseParams: Record<string, unknown> = {
-      page: 1,
+      page: this.parseCursorToPage(input.cursor),
       size: input.limit,
       sortField: input.sort,
       sortOrder: input.order,
@@ -1043,12 +1099,14 @@ export class ToolHandler {
     const response = await helpScoutClient.get<PaginatedResponse<Thread>>(
       `/conversations/${input.conversationId}/threads`,
       {
-        page: 1,
+        page: this.parseCursorToPage(input.cursor),
         size: input.limit,
       }
     );
 
-    const threads = response._embedded?.threads || [];
+    // Sort chronologically (oldest first) for readable conversation flow
+    const threads = (response._embedded?.threads || [])
+      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
     
     // Redact PII if configured
     const processedThreads = threads.map(thread => ({
@@ -1163,7 +1221,7 @@ export class ToolHandler {
 
     // Set up query parameters
     const queryParams: Record<string, unknown> = {
-      page: 1,
+      page: this.parseCursorToPage(input.cursor),
       size: input.limit || 50,
       sortField: 'createdAt',
       sortOrder: 'desc',
@@ -1548,7 +1606,7 @@ export class ToolHandler {
     const input = StructuredConversationFilterInputSchema.parse(args);
 
     const queryParams: Record<string, unknown> = {
-      page: 1,
+      page: this.parseCursorToPage(input.cursor),
       size: input.limit,
       sortField: input.sortBy,
       sortOrder: input.sortOrder,
@@ -2045,6 +2103,53 @@ export class ToolHandler {
           usage: 'Use conversation.id with getThreads to read full message history, or getConversationSummary for a quick overview.',
         }, null, 2),
       }],
+    };
+  }
+
+  // ── Write Tools ──
+
+  private async createNote(args: unknown): Promise<CallToolResult> {
+    const input = CreateNoteInputSchema.parse(args);
+
+    await helpScoutClient.post(
+      `/conversations/${input.conversationId}/notes`,
+      { text: input.text }
+    );
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            conversationId: input.conversationId,
+            message: 'Note added successfully',
+          }, null, 2),
+        },
+      ],
+    };
+  }
+
+  private async updateConversationTags(args: unknown): Promise<CallToolResult> {
+    const input = UpdateConversationTagsInputSchema.parse(args);
+
+    await helpScoutClient.put(
+      `/conversations/${input.conversationId}/tags`,
+      { tags: input.tags }
+    );
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            conversationId: input.conversationId,
+            tags: input.tags,
+            message: 'Tags updated successfully. Note: this replaced all previous tags on the conversation.',
+          }, null, 2),
+        },
+      ],
     };
   }
 }

@@ -121,6 +121,7 @@ export const AdvancedConversationSearchInputSchema = z.object({
   createdAfter: z.string().optional(),
   createdBefore: z.string().optional(),
   limit: z.number().min(1).max(100).default(50),
+  cursor: z.string().optional(),
 });
 
 export const MultiStatusConversationSearchInputSchema = z.object({
@@ -271,6 +272,16 @@ export const GetCustomerContactsInputSchema = z.object({
 
 export const ListAllInboxesInputSchema = z.object({
   limit: z.number().min(1).max(100).default(100),
+});
+
+export const CreateNoteInputSchema = z.object({
+  conversationId: z.string().regex(/^\d+$/, 'Conversation ID must be numeric'),
+  text: z.string().min(1, 'Note text cannot be empty'),
+});
+
+export const UpdateConversationTagsInputSchema = z.object({
+  conversationId: z.string().regex(/^\d+$/, 'Conversation ID must be numeric'),
+  tags: z.array(z.string()),
 });
 
 // Response Types

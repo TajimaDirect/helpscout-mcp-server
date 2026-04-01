@@ -37,7 +37,7 @@ describe('ToolHandler', () => {
     it('should return all available tools', async () => {
       const tools = await toolHandler.listTools();
       
-      expect(tools).toHaveLength(17);
+      expect(tools).toHaveLength(19);
       expect(tools.map(t => t.name)).toEqual([
         'searchInboxes',
         'searchConversations',
@@ -56,6 +56,8 @@ describe('ToolHandler', () => {
         'listOrganizations',
         'getOrganizationMembers',
         'getOrganizationConversations',
+        'createNote',
+        'updateConversationTags',
       ]);
     });
 
