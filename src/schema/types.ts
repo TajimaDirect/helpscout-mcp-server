@@ -284,6 +284,22 @@ export const UpdateConversationTagsInputSchema = z.object({
   tags: z.array(z.string()),
 });
 
+export const AssignConversationInputSchema = z.object({
+  conversationId: z.string().regex(/^\d+$/, 'Conversation ID must be numeric'),
+  userId: z.number().int().positive('User ID must be a positive integer'),
+});
+
+export const GetSavedRepliesInputSchema = z.object({
+  inboxId: z.string().optional(),
+  search: z.string().optional(),
+});
+
+export const GetAttachmentFileInputSchema = z.object({
+  conversationId: z.string().regex(/^\d+$/, 'Conversation ID must be numeric'),
+  attachmentId: z.string().regex(/^\d+$/, 'Attachment ID must be numeric'),
+  mimeType: z.string().min(1, 'mimeType is required (pass through from getThreads attachment.mimeType)'),
+});
+
 // Response Types
 export const ServerTimeSchema = z.object({
   isoTime: z.string(),

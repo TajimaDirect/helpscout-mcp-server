@@ -328,12 +328,46 @@ describe('HelpScoutClient', () => {
 
     it('should add request IDs and timing', async () => {
       const client = new HelpScoutClient();
-      
+
       // Test that the axios instance has interceptors configured
       const axiosClient = (client as any).client;
-      
+
       expect(axiosClient.interceptors.request.handlers).toHaveLength(1);
       expect(axiosClient.interceptors.response.handlers).toHaveLength(1);
+    });
+  });
+
+  describe('patch', () => {
+    beforeEach(() => {
+      process.env.HELPSCOUT_CLIENT_ID = 'test-client-id';
+      process.env.HELPSCOUT_CLIENT_SECRET = 'test-client-secret';
+      process.env.HELPSCOUT_BASE_URL = `${baseURL}/`;
+    });
+
+    it('forwards endpoint + body to the underlying axios client and returns the parsed response', async () => {
+      const client = new HelpScoutClient();
+      // Pre-seed a token so the request interceptor's ensureAuthenticated() short-circuits.
+      (client as any).accessToken = 'mock-access-token';
+      (client as any).tokenExpiresAt = Date.now() + 3600_000;
+
+      // Spy on the internal axios instance — bypass nock + auth interceptor entirely.
+      const axiosClient = (client as any).client;
+      const patchSpy = jest
+        .spyOn(axiosClient, 'patch')
+        .mockResolvedValue({ data: { id: 12345, status: 'updated' } } as never);
+
+      const result = await client.patch<{ id: number; status: string }>(
+        '/conversations/12345',
+        { op: 'replace', path: '/assignTo', value: 99 }
+      );
+
+      expect(result).toEqual({ id: 12345, status: 'updated' });
+      expect(patchSpy).toHaveBeenCalledWith(
+        '/conversations/12345',
+        { op: 'replace', path: '/assignTo', value: 99 }
+      );
+
+      patchSpy.mockRestore();
     });
   });
 });

@@ -30,6 +30,9 @@ import {
   ListOrganizationsInputSchema,
   CreateNoteInputSchema,
   UpdateConversationTagsInputSchema,
+  AssignConversationInputSchema,
+  GetSavedRepliesInputSchema,
+  GetAttachmentFileInputSchema,
   GetOrganizationMembersInputSchema,
   GetOrganizationConversationsInputSchema,
 } from '../schema/types.js';
@@ -580,6 +583,64 @@ export class ToolHandler {
           required: ['conversationId', 'tags'],
         },
       },
+      {
+        name: 'assignConversation',
+        description: 'Assign a Help Scout conversation to a specific user by their user ID.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            conversationId: {
+              type: 'string',
+              description: 'The conversation ID to assign',
+            },
+            userId: {
+              type: 'number',
+              description: 'The Help Scout user ID to assign the conversation to',
+            },
+          },
+          required: ['conversationId', 'userId'],
+        },
+      },
+      {
+        name: 'getSavedReplies',
+        description: 'List saved replies (canned messages) for a Help Scout inbox. Useful for finding pre-written response templates to reference or use when drafting replies.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            inboxId: {
+              type: 'string',
+              description: 'Inbox/mailbox ID. Defaults to 348804.',
+            },
+            search: {
+              type: 'string',
+              description: 'Filter by name — case-insensitive substring match.',
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        name: 'getAttachmentFile',
+        description: 'Fetch the contents of a Help Scout attachment from /conversations/{id}/attachments/{aid}/data. The endpoint returns base64-encoded JSON which this tool returns inline. Use AFTER getThreads — that response includes each attachment\'s id, conversationId, and mimeType (you must pass mimeType in since /data does not return it). For image/* mimeTypes, the file renders inline so Claude can view it natively. For non-images, returned as a resource block with metadata. Files larger than ~5MB return an error.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            conversationId: {
+              type: 'string',
+              description: 'The conversation ID containing the attachment.',
+            },
+            attachmentId: {
+              type: 'string',
+              description: 'The attachment ID from getThreads response.',
+            },
+            mimeType: {
+              type: 'string',
+              description: 'The mimeType from getThreads attachment.mimeType (e.g. "image/jpeg", "application/pdf"). Required.',
+            },
+          },
+          required: ['conversationId', 'attachmentId', 'mimeType'],
+        },
+      },
     ];
   }
 
@@ -694,6 +755,15 @@ export class ToolHandler {
           break;
         case 'updateConversationTags':
           result = await this.updateConversationTags(request.params.arguments || {});
+          break;
+        case 'assignConversation':
+          result = await this.assignConversation(request.params.arguments || {});
+          break;
+        case 'getSavedReplies':
+          result = await this.getSavedReplies(request.params.arguments || {});
+          break;
+        case 'getAttachmentFile':
+          result = await this.getAttachmentFile(request.params.arguments || {});
           break;
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
@@ -2151,6 +2221,158 @@ export class ToolHandler {
         },
       ],
     };
+  }
+
+  private async assignConversation(args: unknown): Promise<CallToolResult> {
+    const input = AssignConversationInputSchema.parse(args);
+
+    await helpScoutClient.patch(
+      `/conversations/${input.conversationId}`,
+      { op: 'replace', path: '/assignTo', value: input.userId }
+    );
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            conversationId: input.conversationId,
+            assignedTo: input.userId,
+            message: 'Conversation assigned successfully.',
+          }, null, 2),
+        },
+      ],
+    };
+  }
+
+  private async getSavedReplies(args: unknown): Promise<CallToolResult> {
+    const input = GetSavedRepliesInputSchema.parse(args);
+    const mailboxId = input.inboxId ?? '348804';
+
+    const response = await helpScoutClient.get<Record<string, unknown> | unknown[]>(
+      `/mailboxes/${mailboxId}/saved-replies`
+    );
+
+    let replies: Array<Record<string, unknown>> = Array.isArray(response)
+      ? (response as Array<Record<string, unknown>>)
+      : [];
+    if (!Array.isArray(response) && response && typeof response === 'object') {
+      const embedded = (response as Record<string, unknown>)._embedded as
+        | Record<string, unknown>
+        | undefined;
+      if (embedded) {
+        const fromEmbedded =
+          (embedded['saved-replies'] as Array<Record<string, unknown>> | undefined) ??
+          (embedded['savedReplies'] as Array<Record<string, unknown>> | undefined) ??
+          (Object.values(embedded)[0] as Array<Record<string, unknown>> | undefined) ??
+          [];
+        replies = fromEmbedded;
+      }
+    }
+
+    if (input.search) {
+      const term = input.search.toLowerCase();
+      replies = replies.filter((r) => {
+        const name = r.name;
+        return typeof name === 'string' && name.toLowerCase().includes(term);
+      });
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            totalCount: replies.length,
+            savedReplies: replies.map((r) => ({
+              id: r.id,
+              name: r.name,
+              text: r.text,
+              createdAt: r.createdAt,
+              updatedAt: r.updatedAt,
+            })),
+          }, null, 2),
+        },
+      ],
+    };
+  }
+
+  private async getAttachmentFile(args: unknown): Promise<CallToolResult> {
+    const input = GetAttachmentFileInputSchema.parse(args);
+    const MAX_DECODED_BYTES = 5_000_000;
+
+    try {
+      const response = await helpScoutClient.get<{ data: string }>(
+        `/conversations/${input.conversationId}/attachments/${input.attachmentId}/data`,
+        undefined,
+        { ttl: 0 }
+      );
+
+      const base64 = response.data;
+      const decodedSize = Math.floor((base64.length * 3) / 4);
+
+      if (decodedSize > MAX_DECODED_BYTES) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'attachment_too_large',
+                size: decodedSize,
+                maxSize: MAX_DECODED_BYTES,
+                mimeType: input.mimeType,
+                message: `Attachment is ~${decodedSize} bytes (decoded), exceeds ${MAX_DECODED_BYTES}-byte cap. View directly in Help Scout instead.`,
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      if (input.mimeType.startsWith('image/')) {
+        return {
+          content: [
+            {
+              type: 'image',
+              data: base64,
+              mimeType: input.mimeType,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: 'resource',
+            resource: {
+              uri: `helpscout://conversations/${input.conversationId}/attachments/${input.attachmentId}`,
+              mimeType: input.mimeType,
+              blob: base64,
+            },
+          },
+          {
+            type: 'text',
+            text: `Returned non-image attachment as base64 resource. mimeType=${input.mimeType}, size=~${decodedSize} bytes.`,
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Unknown error fetching attachment.';
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: 'attachment_fetch_failed',
+              conversationId: input.conversationId,
+              attachmentId: input.attachmentId,
+              message,
+            }, null, 2),
+          },
+        ],
+      };
+    }
   }
 }
 

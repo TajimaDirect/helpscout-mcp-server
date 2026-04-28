@@ -450,6 +450,13 @@ export class HelpScoutClient {
     return response.data;
   }
 
+  async patch<T>(endpoint: string, data?: Record<string, unknown>): Promise<T> {
+    const response = await this.executeWithRetry<T>(() =>
+      this.client.patch<T>(endpoint, data)
+    );
+    return response.data;
+  }
+
   private getDefaultCacheTtl(endpoint: string): number {
     if (endpoint.includes('/conversations')) return 300; // 5 minutes
     if (endpoint.includes('/mailboxes')) return 86400; // 24 hours

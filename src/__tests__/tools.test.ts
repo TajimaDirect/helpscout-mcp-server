@@ -1,5 +1,7 @@
+import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
 import nock from 'nock';
 import { ToolHandler } from '../tools/index.js';
+import { helpScoutClient } from '../utils/helpscout-client.js';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 
 describe('ToolHandler', () => {
@@ -37,7 +39,7 @@ describe('ToolHandler', () => {
     it('should return all available tools', async () => {
       const tools = await toolHandler.listTools();
       
-      expect(tools).toHaveLength(19);
+      expect(tools).toHaveLength(22);
       expect(tools.map(t => t.name)).toEqual([
         'searchInboxes',
         'searchConversations',
@@ -58,6 +60,9 @@ describe('ToolHandler', () => {
         'getOrganizationConversations',
         'createNote',
         'updateConversationTags',
+        'assignConversation',
+        'getSavedReplies',
+        'getAttachmentFile',
       ]);
     });
 
@@ -1962,6 +1967,234 @@ describe('ToolHandler', () => {
         expect(response.clientSideFilteringApplied).toBeDefined();
         expect(response.clientSideFilteringApplied).toContain('createdBefore filter applied');
       }, 30000);
+    });
+  });
+
+  describe('assignConversation', () => {
+    it('returns success when patch succeeds', async () => {
+      const patchSpy = jest.spyOn(helpScoutClient, 'patch').mockResolvedValue({});
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'assignConversation',
+          arguments: { conversationId: '12345', userId: 99 },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const textContent = result.content[0] as { type: 'text'; text: string };
+      const response = JSON.parse(textContent.text);
+
+      expect(patchSpy).toHaveBeenCalledWith(
+        '/conversations/12345',
+        { op: 'replace', path: '/assignTo', value: 99 }
+      );
+      expect(response).toEqual({
+        success: true,
+        conversationId: '12345',
+        assignedTo: 99,
+        message: 'Conversation assigned successfully.',
+      });
+
+      patchSpy.mockRestore();
+    });
+
+    it('propagates upstream error from patch', async () => {
+      const patchSpy = jest.spyOn(helpScoutClient, 'patch').mockRejectedValue(
+        new Error('Conversation not found')
+      );
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'assignConversation',
+          arguments: { conversationId: '12345', userId: 99 },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      // ToolHandler wraps thrown errors in an isError content block
+      expect(result.isError).toBe(true);
+
+      patchSpy.mockRestore();
+    });
+  });
+
+  describe('getSavedReplies', () => {
+    it('returns mapped replies from flat array response', async () => {
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue([
+        { id: 1, name: 'Greeting', text: 'Hello', createdAt: '2024-01-01', updatedAt: '2024-01-02' },
+        { id: 2, name: 'Refund Policy', text: 'Refund...', createdAt: '2024-01-03', updatedAt: '2024-01-04' },
+      ] as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: { name: 'getSavedReplies', arguments: {} },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const textContent = result.content[0] as { type: 'text'; text: string };
+      const response = JSON.parse(textContent.text);
+
+      expect(getSpy).toHaveBeenCalledWith('/mailboxes/348804/saved-replies');
+      expect(response.totalCount).toBe(2);
+      expect(response.savedReplies[0].name).toBe('Greeting');
+      expect(response.savedReplies[1].name).toBe('Refund Policy');
+
+      getSpy.mockRestore();
+    });
+
+    it('returns mapped replies from _embedded.saved-replies response', async () => {
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({
+        _embedded: {
+          'saved-replies': [
+            { id: 5, name: 'Apology', text: 'Sorry', createdAt: '2024-02-01', updatedAt: '2024-02-02' },
+          ],
+        },
+      } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: { name: 'getSavedReplies', arguments: {} },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const textContent = result.content[0] as { type: 'text'; text: string };
+      const response = JSON.parse(textContent.text);
+
+      expect(response.totalCount).toBe(1);
+      expect(response.savedReplies[0].id).toBe(5);
+
+      getSpy.mockRestore();
+    });
+
+    it('filters by case-insensitive substring search', async () => {
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue([
+        { id: 1, name: 'Polarized Lenses Info', text: 'a' },
+        { id: 2, name: 'Refund Policy', text: 'b' },
+        { id: 3, name: 'polarized return', text: 'c' },
+      ] as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getSavedReplies',
+          arguments: { search: 'POLARIZED' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const textContent = result.content[0] as { type: 'text'; text: string };
+      const response = JSON.parse(textContent.text);
+
+      expect(response.totalCount).toBe(2);
+      expect(response.savedReplies.map((r: { id: number }) => r.id).sort()).toEqual([1, 3]);
+
+      getSpy.mockRestore();
+    });
+  });
+
+  describe('getAttachmentFile', () => {
+    it('returns inline image content block for image/* mimeType', async () => {
+      const fakeBase64 = Buffer.from('fake-jpeg-bytes').toString('base64');
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: fakeBase64 } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getAttachmentFile',
+          arguments: { conversationId: '123', attachmentId: '456', mimeType: 'image/jpeg' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      expect(getSpy).toHaveBeenCalledWith(
+        '/conversations/123/attachments/456/data',
+        undefined,
+        { ttl: 0 }
+      );
+      expect(result.content).toHaveLength(1);
+      const block = result.content[0] as { type: string; data: string; mimeType: string };
+      expect(block.type).toBe('image');
+      expect(block.data).toBe(fakeBase64);
+      expect(block.mimeType).toBe('image/jpeg');
+
+      getSpy.mockRestore();
+    });
+
+    it('returns oversize error when decoded size exceeds 5MB cap', async () => {
+      const oversizeBase64 = Buffer.alloc(7_000_000).toString('base64');
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: oversizeBase64 } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getAttachmentFile',
+          arguments: { conversationId: '123', attachmentId: '456', mimeType: 'image/jpeg' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const textContent = result.content[0] as { type: 'text'; text: string };
+      const response = JSON.parse(textContent.text);
+      expect(response.error).toBe('attachment_too_large');
+      expect(response.maxSize).toBe(5_000_000);
+
+      getSpy.mockRestore();
+    });
+
+    it('returns resource block + text metadata for non-image mimeType', async () => {
+      const pdfBase64 = Buffer.from('%PDF-1.4 fake').toString('base64');
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: pdfBase64 } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getAttachmentFile',
+          arguments: { conversationId: '123', attachmentId: '789', mimeType: 'application/pdf' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      expect(result.content).toHaveLength(2);
+      const resourceBlock = result.content[0] as {
+        type: string;
+        resource: { uri: string; mimeType: string; blob: string };
+      };
+      expect(resourceBlock.type).toBe('resource');
+      expect(resourceBlock.resource.uri).toBe('helpscout://conversations/123/attachments/789');
+      expect(resourceBlock.resource.mimeType).toBe('application/pdf');
+      expect(resourceBlock.resource.blob).toBe(pdfBase64);
+      const textBlock = result.content[1] as { type: 'text'; text: string };
+      expect(textBlock.type).toBe('text');
+      expect(textBlock.text).toContain('application/pdf');
+
+      getSpy.mockRestore();
+    });
+
+    it('returns structured error block when fetch fails', async () => {
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockRejectedValue(
+        new Error('Attachment not found')
+      );
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getAttachmentFile',
+          arguments: { conversationId: '123', attachmentId: '999', mimeType: 'image/png' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const textContent = result.content[0] as { type: 'text'; text: string };
+      const response = JSON.parse(textContent.text);
+      expect(response.error).toBe('attachment_fetch_failed');
+      expect(response.conversationId).toBe('123');
+      expect(response.attachmentId).toBe('999');
+      expect(response.message).toContain('Attachment not found');
+
+      getSpy.mockRestore();
     });
   });
 });
