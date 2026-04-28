@@ -1,5 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, jest } from '@jest/globals';
 import nock from 'nock';
+import sharp from 'sharp';
+import { randomFillSync } from 'node:crypto';
 import { ToolHandler } from '../tools/index.js';
 import { helpScoutClient } from '../utils/helpscout-client.js';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -2096,9 +2098,39 @@ describe('ToolHandler', () => {
   });
 
   describe('getAttachmentFile', () => {
-    it('returns inline image content block for image/* mimeType', async () => {
-      const fakeBase64 = Buffer.from('fake-jpeg-bytes').toString('base64');
-      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: fakeBase64 } as never);
+    let smallJpeg: Buffer;
+    let smallPng: Buffer;
+    let largeNoiseJpeg: Buffer;
+
+    beforeAll(async () => {
+      // Tiny solid-color images — well under the 563KB Tier-0 cap.
+      smallJpeg = await sharp({
+        create: { width: 100, height: 100, channels: 3, background: { r: 100, g: 150, b: 200 } },
+      })
+        .jpeg()
+        .toBuffer();
+
+      smallPng = await sharp({
+        create: { width: 100, height: 100, channels: 3, background: { r: 50, g: 100, b: 150 } },
+      })
+        .png()
+        .toBuffer();
+
+      // Noise + blur produces a photo-like JPEG: large at q100, but compresses cleanly
+      // once resized — close to real iPhone-photo behavior. Pure noise is too adversarial.
+      const w = 3000;
+      const h = 2000;
+      const raw = Buffer.alloc(w * h * 3);
+      randomFillSync(raw);
+      largeNoiseJpeg = await sharp(raw, { raw: { width: w, height: h, channels: 3 } })
+        .blur(3)
+        .jpeg({ quality: 100 })
+        .toBuffer();
+    });
+
+    it('returns inline image content block (Tier 0 passthrough) for small JPEG', async () => {
+      const base64 = smallJpeg.toString('base64');
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: base64 } as never);
 
       const request: CallToolRequest = {
         method: 'tools/call',
@@ -2117,15 +2149,77 @@ describe('ToolHandler', () => {
       expect(result.content).toHaveLength(1);
       const block = result.content[0] as { type: string; data: string; mimeType: string };
       expect(block.type).toBe('image');
-      expect(block.data).toBe(fakeBase64);
+      expect(block.data).toBe(base64);
       expect(block.mimeType).toBe('image/jpeg');
 
       getSpy.mockRestore();
     });
 
-    it('returns oversize error when decoded size exceeds 5MB cap', async () => {
-      const oversizeBase64 = Buffer.alloc(7_000_000).toString('base64');
-      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: oversizeBase64 } as never);
+    it('returns inline image content block (Tier 0 passthrough) for small PNG', async () => {
+      const base64 = smallPng.toString('base64');
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: base64 } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getAttachmentFile',
+          arguments: { conversationId: '123', attachmentId: '456', mimeType: 'image/png' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const block = result.content[0] as { type: string; data: string; mimeType: string };
+      expect(block.type).toBe('image');
+      expect(block.data).toBe(base64);
+      expect(block.mimeType).toBe('image/png');
+
+      getSpy.mockRestore();
+    });
+
+    it('resizes large JPEG so it fits under the protocol cap (Tier 2 expected)', async () => {
+      const base64 = largeNoiseJpeg.toString('base64');
+      expect(largeNoiseJpeg.length).toBeGreaterThan(563_000);
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: base64 } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getAttachmentFile',
+          arguments: { conversationId: '123', attachmentId: '456', mimeType: 'image/jpeg' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      expect(result.content).toHaveLength(1);
+      const block = result.content[0] as { type: string; data: string; mimeType: string };
+      expect(block.type).toBe('image');
+      // The output is smaller than the input, fits under the protocol cap, and is still JPEG.
+      expect(block.data.length).toBeLessThan(base64.length);
+      expect(block.data.length).toBeLessThanOrEqual(750_000);
+      expect(block.mimeType).toBe('image/jpeg');
+
+      // Verify the resized buffer's longest edge is <= 2048 (Tier 2 max).
+      const resizedBuffer = Buffer.from(block.data, 'base64');
+      const meta = await sharp(resizedBuffer).metadata();
+      expect(Math.max(meta.width ?? 0, meta.height ?? 0)).toBeLessThanOrEqual(2048);
+
+      getSpy.mockRestore();
+    });
+
+    it('returns attachment_too_large error block when even Tier 3 exceeds the cap', async () => {
+      // Mock resizeImageForResponse to simulate Tier 4 (returned-but-still-oversize).
+      const oversizeBuffer = Buffer.alloc(800_000);
+      const resizeSpy = jest
+        .spyOn(toolHandler as unknown as { resizeImageForResponse: ToolHandler['callTool'] }, 'resizeImageForResponse')
+        .mockResolvedValue({
+          data: oversizeBuffer,
+          mimeType: 'image/jpeg',
+          resizedFrom: { width: 8000, height: 6000, bytes: 9_000_000 },
+        } as never);
+
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: Buffer.from('upstream-bytes').toString('base64') } as never);
 
       const request: CallToolRequest = {
         method: 'tools/call',
@@ -2137,11 +2231,49 @@ describe('ToolHandler', () => {
 
       const result = await toolHandler.callTool(request);
       const textContent = result.content[0] as { type: 'text'; text: string };
-      const response = JSON.parse(textContent.text);
-      expect(response.error).toBe('attachment_too_large');
-      expect(response.maxSize).toBe(5_000_000);
+      const payload = JSON.parse(textContent.text);
+
+      expect(payload.error).toBe('attachment_too_large');
+      expect(payload.maxSize).toBe(750_000);
+      expect(payload.size).toBeGreaterThan(750_000);
+      expect(payload.originalMimeType).toBe('image/jpeg');
+      expect(payload.finalMimeType).toBe('image/jpeg');
+      expect(payload.resizedFrom).toEqual({ width: 8000, height: 6000, bytes: 9_000_000 });
+      expect(payload.message).toContain('still exceeds protocol size limit');
 
       getSpy.mockRestore();
+      resizeSpy.mockRestore();
+    });
+
+    it('reflects updated finalMimeType when resize converts PNG → JPEG', async () => {
+      const resizeSpy = jest
+        .spyOn(toolHandler as unknown as { resizeImageForResponse: ToolHandler['callTool'] }, 'resizeImageForResponse')
+        .mockResolvedValue({
+          data: smallJpeg,
+          mimeType: 'image/jpeg',
+          resizedFrom: { width: 4000, height: 3000, bytes: 2_000_000 },
+        } as never);
+
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: Buffer.from('original-png-bytes').toString('base64') } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getAttachmentFile',
+          arguments: { conversationId: '123', attachmentId: '456', mimeType: 'image/png' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const block = result.content[0] as { type: string; data: string; mimeType: string };
+      expect(block.type).toBe('image');
+      expect(block.mimeType).toBe('image/jpeg');
+      expect(block.data).toBe(smallJpeg.toString('base64'));
+
+      getSpy.mockRestore();
+      resizeSpy.mockRestore();
     });
 
     it('returns resource block + text metadata for non-image mimeType', async () => {
@@ -2195,6 +2327,95 @@ describe('ToolHandler', () => {
       expect(response.message).toContain('Attachment not found');
 
       getSpy.mockRestore();
+    });
+  });
+
+  describe('resizeImageForResponse', () => {
+    let smallJpeg: Buffer;
+    let smallPng: Buffer;
+    let largeNoiseJpeg: Buffer;
+
+    beforeAll(async () => {
+      smallJpeg = await sharp({
+        create: { width: 100, height: 100, channels: 3, background: { r: 100, g: 150, b: 200 } },
+      })
+        .jpeg()
+        .toBuffer();
+
+      smallPng = await sharp({
+        create: { width: 100, height: 100, channels: 3, background: { r: 50, g: 100, b: 150 } },
+      })
+        .png()
+        .toBuffer();
+
+      const w = 3000;
+      const h = 2000;
+      const raw = Buffer.alloc(w * h * 3);
+      randomFillSync(raw);
+      largeNoiseJpeg = await sharp(raw, { raw: { width: w, height: h, channels: 3 } })
+        .jpeg({ quality: 100 })
+        .toBuffer();
+    });
+
+    const callResize = async (buffer: Buffer, mimeType: string) => {
+      const handler = toolHandler as unknown as {
+        resizeImageForResponse: (
+          b: Buffer,
+          m: string
+        ) => Promise<{
+          data: Buffer;
+          mimeType: string;
+          resizedFrom?: { width: number; height: number; bytes: number };
+        }>;
+      };
+      return handler.resizeImageForResponse(buffer, mimeType);
+    };
+
+    it('Tier 0: returns small JPEG unchanged with no resizedFrom', async () => {
+      const result = await callResize(smallJpeg, 'image/jpeg');
+      expect(result.data).toBe(smallJpeg);
+      expect(result.mimeType).toBe('image/jpeg');
+      expect(result.resizedFrom).toBeUndefined();
+    });
+
+    it('Tier 0: returns small PNG unchanged with no resizedFrom', async () => {
+      const result = await callResize(smallPng, 'image/png');
+      expect(result.data).toBe(smallPng);
+      expect(result.mimeType).toBe('image/png');
+      expect(result.resizedFrom).toBeUndefined();
+    });
+
+    it('large JPEG triggers resize: longest edge ≤2048 (Tier 2) or ≤1600 (Tier 3), stays JPEG, resizedFrom populated', async () => {
+      expect(largeNoiseJpeg.length).toBeGreaterThan(563_000);
+      const result = await callResize(largeNoiseJpeg, 'image/jpeg');
+
+      // Output is meaningfully smaller than input.
+      expect(result.data.length).toBeLessThan(largeNoiseJpeg.length);
+      expect(result.mimeType).toBe('image/jpeg');
+      expect(result.resizedFrom).toEqual({ width: 3000, height: 2000, bytes: largeNoiseJpeg.length });
+
+      // Whichever tier wins, the longest edge is bounded by Tier 2's cap.
+      const meta = await sharp(result.data).metadata();
+      expect(Math.max(meta.width ?? 0, meta.height ?? 0)).toBeLessThanOrEqual(2048);
+    });
+
+    it('returns original buffer unchanged when sharp cannot parse the bytes', async () => {
+      // Bytes too small to trigger metadata read (under TARGET_BYTES) → Tier 0 passthrough.
+      const garbage = Buffer.from('this is not an image, just text bytes');
+      const result = await callResize(garbage, 'image/jpeg');
+      expect(result.data).toBe(garbage);
+      expect(result.mimeType).toBe('image/jpeg');
+      expect(result.resizedFrom).toBeUndefined();
+    });
+
+    it('returns original buffer when sharp fails on oversize unparseable input', async () => {
+      // Larger-than-cap garbage triggers the metadata path; sharp throws, handler returns original.
+      const garbage = Buffer.alloc(700_000);
+      randomFillSync(garbage);
+      const result = await callResize(garbage, 'image/jpeg');
+      expect(result.data).toBe(garbage);
+      expect(result.mimeType).toBe('image/jpeg');
+      expect(result.resizedFrom).toBeUndefined();
     });
   });
 });

@@ -1,4 +1,5 @@
 import { Tool, CallToolRequest, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import sharp from 'sharp';
 import { PaginatedResponse, helpScoutClient } from '../utils/helpscout-client.js';
 import { createMcpToolError, isApiError } from '../utils/mcp-errors.js';
 import { HelpScoutAPIConstraints, ToolCallContext } from '../utils/api-constraints.js';
@@ -621,7 +622,7 @@ export class ToolHandler {
       },
       {
         name: 'getAttachmentFile',
-        description: 'Fetch the contents of a Help Scout attachment from /conversations/{id}/attachments/{aid}/data. The endpoint returns base64-encoded JSON which this tool returns inline. Use AFTER getThreads — that response includes each attachment\'s id, conversationId, and mimeType (you must pass mimeType in since /data does not return it). For image/* mimeTypes, the file renders inline so Claude can view it natively. For non-images, returned as a resource block with metadata. Files larger than ~5MB return an error.',
+        description: 'Fetch the contents of a Help Scout attachment. Use AFTER getThreads — that response provides each attachment\'s id, conversationId, and mimeType (mimeType is required since the /data endpoint doesn\'t return it). For images, the file renders inline so Claude can view it natively. Large images are automatically resized to fit under the MCP protocol size limit while preserving readability — small images and PNG screenshots pass through unchanged. PNG-format inputs are preserved as PNG when possible (better for screenshots and rendered text); JPEG/HEIC inputs may be re-encoded as JPEG. The tool tries multiple resize tiers (2048px high quality → 1600px moderate quality) before failing. Non-image attachments (PDF, etc.) are returned as resource blocks without modification. Files that still exceed the limit after resize return an error.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -2298,9 +2299,116 @@ export class ToolHandler {
     };
   }
 
+  private async resizeImageForResponse(
+    buffer: Buffer,
+    mimeType: string
+  ): Promise<{
+    data: Buffer;
+    mimeType: string;
+    resizedFrom?: { width: number; height: number; bytes: number };
+  }> {
+    const TARGET_BYTES = 563_000;
+
+    if (buffer.length <= TARGET_BYTES) {
+      return { data: buffer, mimeType };
+    }
+
+    let originalDims: { width: number; height: number; bytes: number };
+    let format: string | undefined;
+    try {
+      const metadata = await sharp(buffer).metadata();
+      originalDims = {
+        width: metadata.width ?? 0,
+        height: metadata.height ?? 0,
+        bytes: buffer.length,
+      };
+      format = metadata.format;
+    } catch (err) {
+      logger.debug('sharp metadata failed; returning original buffer', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { data: buffer, mimeType };
+    }
+
+    const isPng = mimeType === 'image/png' || format === 'png';
+
+    if (!isPng) {
+      try {
+        const tier1 = await sharp(buffer).jpeg({ quality: 95 }).toBuffer();
+        if (tier1.length <= TARGET_BYTES) {
+          logger.debug('image resize tier 1', {
+            tier: 1,
+            originalBytes: buffer.length,
+            finalBytes: tier1.length,
+            originalDims,
+            mimeType: 'image/jpeg',
+          });
+          return { data: tier1, mimeType: 'image/jpeg' };
+        }
+      } catch (err) {
+        logger.debug('sharp tier 1 failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    try {
+      const tier2Pipeline = sharp(buffer).resize({
+        width: 2048,
+        height: 2048,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+      const tier2 = isPng
+        ? await tier2Pipeline.png().toBuffer()
+        : await tier2Pipeline.jpeg({ quality: 90 }).toBuffer();
+      const tier2Mime = isPng ? 'image/png' : 'image/jpeg';
+      if (tier2.length <= TARGET_BYTES) {
+        logger.debug('image resize tier 2', {
+          tier: 2,
+          originalBytes: buffer.length,
+          finalBytes: tier2.length,
+          originalDims,
+          mimeType: tier2Mime,
+        });
+        return { data: tier2, mimeType: tier2Mime, resizedFrom: originalDims };
+      }
+    } catch (err) {
+      logger.debug('sharp tier 2 failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    try {
+      const tier3 = await sharp(buffer)
+        .resize({
+          width: 1600,
+          height: 1600,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+        .jpeg({ quality: 82 })
+        .toBuffer();
+      logger.debug('image resize tier 3', {
+        tier: tier3.length <= TARGET_BYTES ? 3 : 4,
+        originalBytes: buffer.length,
+        finalBytes: tier3.length,
+        originalDims,
+        mimeType: 'image/jpeg',
+      });
+      return { data: tier3, mimeType: 'image/jpeg', resizedFrom: originalDims };
+    } catch (err) {
+      logger.debug('sharp tier 3 failed; returning original', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return { data: buffer, mimeType, resizedFrom: originalDims };
+    }
+  }
+
   private async getAttachmentFile(args: unknown): Promise<CallToolResult> {
     const input = GetAttachmentFileInputSchema.parse(args);
-    const MAX_DECODED_BYTES = 5_000_000;
+    const MAX_BASE64_BYTES = 750_000;
+    const NON_IMAGE_MAX_DECODED_BYTES = 5_000_000;
 
     try {
       const response = await helpScoutClient.get<{ data: string }>(
@@ -2309,33 +2417,62 @@ export class ToolHandler {
         { ttl: 0 }
       );
 
-      const base64 = response.data;
-      const decodedSize = Math.floor((base64.length * 3) / 4);
+      const rawBuffer = Buffer.from(response.data, 'base64');
 
-      if (decodedSize > MAX_DECODED_BYTES) {
+      if (input.mimeType.startsWith('image/')) {
+        const {
+          data: finalBuffer,
+          mimeType: finalMimeType,
+          resizedFrom,
+        } = await this.resizeImageForResponse(rawBuffer, input.mimeType);
+
+        const finalBase64 = finalBuffer.toString('base64');
+
+        if (finalBase64.length > MAX_BASE64_BYTES) {
+          const message = resizedFrom
+            ? `Image was resized but still exceeds protocol size limit. Original: ${resizedFrom.width}x${resizedFrom.height}, ${resizedFrom.bytes} bytes. Final: ${finalBase64.length} bytes (over ${MAX_BASE64_BYTES}). View directly in Help Scout.`
+            : `Attachment exceeds size limit (${finalBase64.length} bytes, max ${MAX_BASE64_BYTES}). View directly in Help Scout.`;
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'attachment_too_large',
+                  size: finalBase64.length,
+                  maxSize: MAX_BASE64_BYTES,
+                  originalMimeType: input.mimeType,
+                  finalMimeType,
+                  resizedFrom,
+                  message,
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: 'image',
+              data: finalBase64,
+              mimeType: finalMimeType,
+            },
+          ],
+        };
+      }
+
+      if (rawBuffer.length > NON_IMAGE_MAX_DECODED_BYTES) {
         return {
           content: [
             {
               type: 'text',
               text: JSON.stringify({
                 error: 'attachment_too_large',
-                size: decodedSize,
-                maxSize: MAX_DECODED_BYTES,
+                size: rawBuffer.length,
+                maxSize: NON_IMAGE_MAX_DECODED_BYTES,
                 mimeType: input.mimeType,
-                message: `Attachment is ~${decodedSize} bytes (decoded), exceeds ${MAX_DECODED_BYTES}-byte cap. View directly in Help Scout instead.`,
+                message: `Attachment is ${rawBuffer.length} bytes (decoded), exceeds ${NON_IMAGE_MAX_DECODED_BYTES}-byte cap. View directly in Help Scout instead.`,
               }, null, 2),
-            },
-          ],
-        };
-      }
-
-      if (input.mimeType.startsWith('image/')) {
-        return {
-          content: [
-            {
-              type: 'image',
-              data: base64,
-              mimeType: input.mimeType,
             },
           ],
         };
@@ -2348,12 +2485,12 @@ export class ToolHandler {
             resource: {
               uri: `helpscout://conversations/${input.conversationId}/attachments/${input.attachmentId}`,
               mimeType: input.mimeType,
-              blob: base64,
+              blob: response.data,
             },
           },
           {
             type: 'text',
-            text: `Returned non-image attachment as base64 resource. mimeType=${input.mimeType}, size=~${decodedSize} bytes.`,
+            text: `Returned non-image attachment as base64 resource. mimeType=${input.mimeType}, size=~${rawBuffer.length} bytes.`,
           },
         ],
       };
