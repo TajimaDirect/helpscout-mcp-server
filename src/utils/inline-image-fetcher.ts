@@ -15,7 +15,7 @@
 
 import axios from 'axios';
 import dns from 'node:dns/promises';
-import { fromBuffer as fileTypeFromBuffer } from 'file-type';
+import FileType from 'file-type';
 import { logger } from './logger.js';
 import { config } from './config.js';
 
@@ -122,7 +122,7 @@ export async function fetchInlineImage(url: string): Promise<InlineImageFetchRes
 
     const buffer = Buffer.from(response.data);
 
-    const detected = await fileTypeFromBuffer(buffer);
+    const detected = await FileType.fromBuffer(buffer);
 
     if (!detected) {
       throw new Error(
