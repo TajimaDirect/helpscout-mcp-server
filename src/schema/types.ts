@@ -300,6 +300,16 @@ export const GetAttachmentFileInputSchema = z.object({
   mimeType: z.string().min(1, 'mimeType is required (pass through from getThreads attachment.mimeType)'),
 });
 
+export const PushAttachmentToAirtableInputSchema = z.object({
+  conversationId: z.string().regex(/^\d+$/, 'Help Scout conversation ID must be numeric'),
+  attachmentId: z.string().regex(/^\d+$/, 'Help Scout attachment ID must be numeric'),
+  filename: z.string().min(1, 'filename is required (use the filename from getThreads attachment.filename)'),
+  contentType: z.string().min(1, 'contentType is required (use the mimeType from getThreads attachment.mimeType)'),
+  baseId: z.string().regex(/^app[a-zA-Z0-9]+$/, 'Airtable base ID must start with "app"'),
+  recordId: z.string().regex(/^rec[a-zA-Z0-9]+$/, 'Airtable record ID must start with "rec"'),
+  fieldId: z.string().regex(/^fld[a-zA-Z0-9]+$/, 'Airtable field ID must start with "fld" — use field IDs not names to avoid breakage from renames'),
+});
+
 // Response Types
 export const ServerTimeSchema = z.object({
   isoTime: z.string(),

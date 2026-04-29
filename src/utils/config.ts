@@ -13,6 +13,9 @@ export interface Config {
     baseUrl: string;
     defaultInboxId?: string; // Optional: default inbox for scoped searches
   };
+  airtable: {
+    pat?: string;           // Optional: enables pushAttachmentToAirtable; other tools work without it
+  };
   cache: {
     ttlSeconds: number;
     maxSize: number;
@@ -40,6 +43,9 @@ export const config: Config = {
     clientSecret: process.env.HELPSCOUT_APP_SECRET || process.env.HELPSCOUT_CLIENT_SECRET || '',
     baseUrl: process.env.HELPSCOUT_BASE_URL || 'https://api.helpscout.net/v2/',
     defaultInboxId: process.env.HELPSCOUT_DEFAULT_INBOX_ID,
+  },
+  airtable: {
+    pat: process.env.AIRTABLE_PAT,
   },
   cache: {
     ttlSeconds: parseInt(process.env.CACHE_TTL_SECONDS || '300', 10),
@@ -99,5 +105,15 @@ export function validateConfig(): void {
       `Current value: ${config.helpscout.baseUrl}\n` +
       'Please use: https://api.helpscout.net/v2/'
     );
+  }
+
+  // Soft check: warn if Airtable PAT is missing (pushAttachmentToAirtable will be unavailable, but other tools still work).
+  // Use console.error directly (stderr) to avoid a circular import with logger.ts.
+  if (!config.airtable.pat) {
+    console.error(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      message: 'AIRTABLE_PAT not set — pushAttachmentToAirtable will return an error if called. Other tools work normally.',
+    }));
   }
 }

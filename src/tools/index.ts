@@ -1,6 +1,7 @@
 import { Tool, CallToolRequest, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import sharp from 'sharp';
 import { PaginatedResponse, helpScoutClient } from '../utils/helpscout-client.js';
+import { airtableClient } from '../utils/airtable-client.js';
 import { createMcpToolError, isApiError } from '../utils/mcp-errors.js';
 import { HelpScoutAPIConstraints, ToolCallContext } from '../utils/api-constraints.js';
 import { logger } from '../utils/logger.js';
@@ -34,6 +35,7 @@ import {
   AssignConversationInputSchema,
   GetSavedRepliesInputSchema,
   GetAttachmentFileInputSchema,
+  PushAttachmentToAirtableInputSchema,
   GetOrganizationMembersInputSchema,
   GetOrganizationConversationsInputSchema,
 } from '../schema/types.js';
@@ -642,6 +644,44 @@ export class ToolHandler {
           required: ['conversationId', 'attachmentId', 'mimeType'],
         },
       },
+      {
+        name: 'pushAttachmentToAirtable',
+        description: 'Copy a Help Scout attachment directly into an Airtable attachment field. Use AFTER getThreads to obtain the conversationId, attachmentId, filename, and mimeType. The tool fetches the attachment from Help Scout (auth-walled, not URL-accessible), then uploads it to the specified Airtable record/field. Files under 5MB are uploaded as-is to preserve original quality. Files over 5MB are auto-compressed via sharp (target 4MB, max edge 3000px, JPEG q92) — original quality is preserved when possible. Use field IDs (not field names) for the destination to avoid breakage from field renames. Common use cases: archiving customer return photos, Rx images, frame issue photos, fit complaint photos. Generic — works for any Help Scout attachment to any attachment field on any table in the configured Airtable base.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            conversationId: {
+              type: 'string',
+              description: 'Help Scout conversation ID containing the attachment.',
+            },
+            attachmentId: {
+              type: 'string',
+              description: 'Help Scout attachment ID from getThreads response.',
+            },
+            filename: {
+              type: 'string',
+              description: 'The filename to give the file in Airtable (use the original filename from getThreads attachment.filename).',
+            },
+            contentType: {
+              type: 'string',
+              description: 'The MIME type of the attachment (use mimeType from getThreads attachment.mimeType, e.g., "image/jpeg" or "application/pdf").',
+            },
+            baseId: {
+              type: 'string',
+              description: 'Airtable base ID (starts with "app").',
+            },
+            recordId: {
+              type: 'string',
+              description: 'Airtable record ID to attach to (starts with "rec").',
+            },
+            fieldId: {
+              type: 'string',
+              description: 'Airtable attachment field ID (starts with "fld"). Use field IDs not names to avoid breakage. The Airtable upload endpoint appends to existing attachments natively — no replace mode.',
+            },
+          },
+          required: ['conversationId', 'attachmentId', 'filename', 'contentType', 'baseId', 'recordId', 'fieldId'],
+        },
+      },
     ];
   }
 
@@ -765,6 +805,9 @@ export class ToolHandler {
           break;
         case 'getAttachmentFile':
           result = await this.getAttachmentFile(request.params.arguments || {});
+          break;
+        case 'pushAttachmentToAirtable':
+          result = await this.pushAttachmentToAirtable(request.params.arguments || {});
           break;
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
@@ -2504,6 +2547,181 @@ export class ToolHandler {
               error: 'attachment_fetch_failed',
               conversationId: input.conversationId,
               attachmentId: input.attachmentId,
+              message,
+            }, null, 2),
+          },
+        ],
+      };
+    }
+  }
+
+  private async pushAttachmentToAirtable(args: unknown): Promise<CallToolResult> {
+    const input = PushAttachmentToAirtableInputSchema.parse(args);
+
+    const AIRTABLE_MAX_BYTES = 5_000_000;
+    const COMPRESS_TARGET_BYTES = 4_000_000;
+    const COMPRESS_MAX_EDGE = 3000;
+    const COMPRESS_QUALITY = 92;
+
+    try {
+      const hsResponse = await helpScoutClient.get<{ data: string }>(
+        `/conversations/${input.conversationId}/attachments/${input.attachmentId}/data`,
+        undefined,
+        { ttl: 0 }
+      );
+
+      const originalBuffer = Buffer.from(hsResponse.data, 'base64');
+      const originalSize = originalBuffer.length;
+
+      let uploadBuffer = originalBuffer;
+      let uploadContentType = input.contentType;
+      let compressed = false;
+      let compressionMetadata:
+        | { originalSize: number; finalSize: number; originalDims?: { width: number; height: number } }
+        | undefined;
+
+      if (originalSize > AIRTABLE_MAX_BYTES) {
+        if (!input.contentType.startsWith('image/')) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'attachment_too_large_non_image',
+                  originalSize,
+                  maxSize: AIRTABLE_MAX_BYTES,
+                  contentType: input.contentType,
+                  message: `Non-image attachment is ${originalSize} bytes, exceeds Airtable's 5MB cap. Cannot auto-compress non-images. Upload manually or split the file.`,
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        try {
+          const metadata = await sharp(originalBuffer).metadata();
+          const firstPass = await sharp(originalBuffer)
+            .resize({
+              width: COMPRESS_MAX_EDGE,
+              height: COMPRESS_MAX_EDGE,
+              fit: 'inside',
+              withoutEnlargement: true,
+            })
+            .jpeg({ quality: COMPRESS_QUALITY })
+            .toBuffer();
+
+          if (firstPass.length > COMPRESS_TARGET_BYTES) {
+            const aggressive = await sharp(originalBuffer)
+              .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true })
+              .jpeg({ quality: 85 })
+              .toBuffer();
+
+            if (aggressive.length > AIRTABLE_MAX_BYTES) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: JSON.stringify({
+                      error: 'compression_failed_to_fit',
+                      originalSize,
+                      compressedSize: aggressive.length,
+                      maxSize: AIRTABLE_MAX_BYTES,
+                      message: `Image still exceeds 5MB after aggressive compression (${aggressive.length} bytes). Original may be unusually large or already heavily compressed. Manual upload required.`,
+                    }, null, 2),
+                  },
+                ],
+              };
+            }
+
+            uploadBuffer = aggressive;
+          } else {
+            uploadBuffer = firstPass;
+          }
+
+          uploadContentType = 'image/jpeg';
+          compressed = true;
+          compressionMetadata = {
+            originalSize,
+            finalSize: uploadBuffer.length,
+            originalDims:
+              metadata.width && metadata.height
+                ? { width: metadata.width, height: metadata.height }
+                : undefined,
+          };
+
+          logger.debug('image compressed for airtable upload', {
+            originalSize,
+            compressedSize: uploadBuffer.length,
+            originalDims: compressionMetadata.originalDims,
+          });
+        } catch (sharpError: unknown) {
+          const message = sharpError instanceof Error ? sharpError.message : 'sharp processing failed';
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  error: 'compression_failed',
+                  originalSize,
+                  maxSize: AIRTABLE_MAX_BYTES,
+                  message: `Image is ${originalSize} bytes (over Airtable's 5MB cap) and compression failed: ${message}. Manual upload required.`,
+                }, null, 2),
+              },
+            ],
+          };
+        }
+      }
+
+      const finalFilename =
+        compressed && !/\.(jpg|jpeg)$/i.test(input.filename)
+          ? input.filename.replace(/\.[^.]+$/, '.jpg')
+          : input.filename;
+
+      const airtableResponse = await airtableClient.uploadAttachment({
+        baseId: input.baseId,
+        recordId: input.recordId,
+        fieldId: input.fieldId,
+        filename: finalFilename,
+        contentType: uploadContentType,
+        base64: uploadBuffer.toString('base64'),
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: true,
+              airtableRecordId: airtableResponse.id,
+              baseId: input.baseId,
+              fieldId: input.fieldId,
+              uploadedAs: {
+                filename: finalFilename,
+                contentType: uploadContentType,
+                sizeBytes: uploadBuffer.length,
+              },
+              compressed,
+              compressionMetadata,
+              message: compressed
+                ? `Attachment compressed (${compressionMetadata!.originalSize} → ${compressionMetadata!.finalSize} bytes) and uploaded to Airtable record ${airtableResponse.id}.`
+                : `Attachment uploaded to Airtable record ${airtableResponse.id} at original quality (${uploadBuffer.length} bytes).`,
+            }, null, 2),
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: 'push_failed',
+              conversationId: input.conversationId,
+              attachmentId: input.attachmentId,
+              baseId: input.baseId,
+              recordId: input.recordId,
+              fieldId: input.fieldId,
               message,
             }, null, 2),
           },

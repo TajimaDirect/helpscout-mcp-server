@@ -4,6 +4,7 @@ import sharp from 'sharp';
 import { randomFillSync } from 'node:crypto';
 import { ToolHandler } from '../tools/index.js';
 import { helpScoutClient } from '../utils/helpscout-client.js';
+import { airtableClient } from '../utils/airtable-client.js';
 import type { CallToolRequest } from '@modelcontextprotocol/sdk/types.js';
 
 describe('ToolHandler', () => {
@@ -41,7 +42,7 @@ describe('ToolHandler', () => {
     it('should return all available tools', async () => {
       const tools = await toolHandler.listTools();
       
-      expect(tools).toHaveLength(22);
+      expect(tools).toHaveLength(23);
       expect(tools.map(t => t.name)).toEqual([
         'searchInboxes',
         'searchConversations',
@@ -65,6 +66,7 @@ describe('ToolHandler', () => {
         'assignConversation',
         'getSavedReplies',
         'getAttachmentFile',
+        'pushAttachmentToAirtable',
       ]);
     });
 
@@ -2416,6 +2418,255 @@ describe('ToolHandler', () => {
       expect(result.data).toBe(garbage);
       expect(result.mimeType).toBe('image/jpeg');
       expect(result.resizedFrom).toBeUndefined();
+    });
+  });
+
+  describe('pushAttachmentToAirtable', () => {
+    let smallJpeg: Buffer;
+    let bigNoiseJpeg: Buffer;
+
+    beforeAll(async () => {
+      smallJpeg = await sharp({
+        create: { width: 100, height: 100, channels: 3, background: { r: 100, g: 150, b: 200 } },
+      })
+        .jpeg()
+        .toBuffer();
+
+      // Random noise > 5MB to force the compression branch.
+      const w = 4000;
+      const h = 3000;
+      const raw = Buffer.alloc(w * h * 3);
+      randomFillSync(raw);
+      bigNoiseJpeg = await sharp(raw, { raw: { width: w, height: h, channels: 3 } })
+        .jpeg({ quality: 100 })
+        .toBuffer();
+    });
+
+    const baseArgs = {
+      conversationId: '12345',
+      attachmentId: '67890',
+      filename: 'photo.jpeg',
+      contentType: 'image/jpeg',
+      baseId: 'appIM1o9NJYpIaji1',
+      recordId: 'recABCDE12345',
+      fieldId: 'fldXYZ9876543',
+    };
+
+    it('uploads small image at original quality without compression', async () => {
+      const base64 = smallJpeg.toString('base64');
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: base64 } as never);
+      const uploadSpy = jest
+        .spyOn(airtableClient, 'uploadAttachment')
+        .mockResolvedValue({
+          id: 'recABCDE12345',
+          createdTime: '2026-04-28T12:00:00.000Z',
+          fields: {},
+        } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: { name: 'pushAttachmentToAirtable', arguments: baseArgs },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const text = (result.content[0] as { type: 'text'; text: string }).text;
+      const payload = JSON.parse(text);
+
+      expect(payload.success).toBe(true);
+      expect(payload.compressed).toBe(false);
+      expect(payload.compressionMetadata).toBeUndefined();
+      expect(payload.airtableRecordId).toBe('recABCDE12345');
+      expect(payload.uploadedAs.contentType).toBe('image/jpeg');
+      expect(payload.uploadedAs.filename).toBe('photo.jpeg');
+      expect(payload.uploadedAs.sizeBytes).toBe(smallJpeg.length);
+
+      expect(uploadSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          baseId: baseArgs.baseId,
+          recordId: baseArgs.recordId,
+          fieldId: baseArgs.fieldId,
+          filename: 'photo.jpeg',
+          contentType: 'image/jpeg',
+          base64,
+        })
+      );
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+    });
+
+    it('compresses oversized image and rewrites HEIC filename to .jpg', async () => {
+      expect(bigNoiseJpeg.length).toBeGreaterThan(5_000_000);
+      const base64 = bigNoiseJpeg.toString('base64');
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: base64 } as never);
+      const uploadSpy = jest
+        .spyOn(airtableClient, 'uploadAttachment')
+        .mockResolvedValue({
+          id: 'recCOMP12345',
+          createdTime: '2026-04-28T12:00:00.000Z',
+          fields: {},
+        } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'pushAttachmentToAirtable',
+          arguments: { ...baseArgs, filename: 'IMG_4242.heic' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.success).toBe(true);
+      expect(payload.compressed).toBe(true);
+      expect(payload.compressionMetadata.originalSize).toBeGreaterThan(5_000_000);
+      expect(payload.compressionMetadata.finalSize).toBeLessThanOrEqual(5_000_000);
+      expect(payload.compressionMetadata.originalDims).toEqual({ width: 4000, height: 3000 });
+      expect(payload.uploadedAs.contentType).toBe('image/jpeg');
+      expect(payload.uploadedAs.filename).toBe('IMG_4242.jpg');
+
+      expect(uploadSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          contentType: 'image/jpeg',
+          filename: 'IMG_4242.jpg',
+        })
+      );
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+    }, 30_000);
+
+    it('preserves original .jpeg filename when no compression happened', async () => {
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: smallJpeg.toString('base64') } as never);
+      const uploadSpy = jest
+        .spyOn(airtableClient, 'uploadAttachment')
+        .mockResolvedValue({
+          id: 'recPRES12345',
+          createdTime: '2026-04-28T12:00:00.000Z',
+          fields: {},
+        } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'pushAttachmentToAirtable',
+          arguments: { ...baseArgs, filename: 'rx-scan.jpeg' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.uploadedAs.filename).toBe('rx-scan.jpeg');
+      expect(uploadSpy.mock.calls[0]?.[0].filename).toBe('rx-scan.jpeg');
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+    });
+
+    it('returns attachment_too_large_non_image when a >5MB non-image is sent and never calls Airtable', async () => {
+      const big = Buffer.alloc(6_000_000);
+      randomFillSync(big);
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: big.toString('base64') } as never);
+      const uploadSpy = jest.spyOn(airtableClient, 'uploadAttachment');
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'pushAttachmentToAirtable',
+          arguments: { ...baseArgs, filename: 'big.pdf', contentType: 'application/pdf' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.error).toBe('attachment_too_large_non_image');
+      expect(payload.maxSize).toBe(5_000_000);
+      expect(payload.contentType).toBe('application/pdf');
+      expect(uploadSpy).not.toHaveBeenCalled();
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+    });
+
+    it('returns compression_failed when sharp cannot process oversized garbage tagged as image', async () => {
+      const garbage = Buffer.alloc(6_000_000);
+      randomFillSync(garbage);
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: garbage.toString('base64') } as never);
+      const uploadSpy = jest.spyOn(airtableClient, 'uploadAttachment');
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: { name: 'pushAttachmentToAirtable', arguments: baseArgs },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.error).toBe('compression_failed');
+      expect(payload.originalSize).toBe(6_000_000);
+      expect(uploadSpy).not.toHaveBeenCalled();
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+    });
+
+    it('returns push_failed and never calls Airtable when Help Scout fetch rejects', async () => {
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockRejectedValue(new Error('Help Scout 404 not found'));
+      const uploadSpy = jest.spyOn(airtableClient, 'uploadAttachment');
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: { name: 'pushAttachmentToAirtable', arguments: baseArgs },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.error).toBe('push_failed');
+      expect(payload.message).toContain('Help Scout 404 not found');
+      expect(uploadSpy).not.toHaveBeenCalled();
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+    });
+
+    it('returns push_failed when Airtable upload rejects, preserving the upstream message', async () => {
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: smallJpeg.toString('base64') } as never);
+      const uploadSpy = jest
+        .spyOn(airtableClient, 'uploadAttachment')
+        .mockRejectedValue(new Error('Airtable upload failed (422): {"message":"Invalid field"}'));
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: { name: 'pushAttachmentToAirtable', arguments: baseArgs },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.error).toBe('push_failed');
+      expect(payload.message).toContain('Airtable upload failed (422)');
+      expect(payload.message).toContain('Invalid field');
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
     });
   });
 });
