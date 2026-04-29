@@ -15,6 +15,7 @@
 
 import axios from 'axios';
 import dns from 'node:dns/promises';
+import { fromBuffer as fileTypeFromBuffer } from 'file-type';
 import { logger } from './logger.js';
 import { config } from './config.js';
 
@@ -120,16 +121,31 @@ export async function fetchInlineImage(url: string): Promise<InlineImageFetchRes
     });
 
     const buffer = Buffer.from(response.data);
-    const rawContentType = response.headers['content-type'];
-    const contentType = String(rawContentType || 'application/octet-stream').split(';')[0].trim();
 
-    if (!contentType.startsWith('image/')) {
+    const detected = await fileTypeFromBuffer(buffer);
+
+    if (!detected) {
       throw new Error(
-        `URL did not return an image content type. Got "${contentType}". This tool is for fetching images only.`
+        `Could not detect file type from response bytes (${buffer.length} bytes). ` +
+        `The URL may not be returning a recognized image format. First 16 bytes (hex): ${buffer.subarray(0, 16).toString('hex')}.`
       );
     }
 
-    logger.debug('inline image fetched', { hostname, contentType, bytes: buffer.length });
+    if (!detected.mime.startsWith('image/')) {
+      throw new Error(
+        `URL returned a non-image file. Detected type: "${detected.mime}" (${detected.ext}). This tool is for fetching images only.`
+      );
+    }
+
+    const contentType = detected.mime;
+
+    logger.debug('inline image detected via magic bytes', {
+      hostname,
+      detectedMime: detected.mime,
+      detectedExt: detected.ext,
+      headerContentType: response.headers['content-type'],
+      bytes: buffer.length,
+    });
 
     return { data: buffer, contentType };
   } catch (error: unknown) {
