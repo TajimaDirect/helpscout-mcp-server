@@ -5,6 +5,21 @@ if (process.env.NODE_ENV !== 'test') {
   dotenv.config();
 }
 
+const HARDCODED_INLINE_IMAGE_ALLOWLIST = [
+  'd33v4339jhl8k0.cloudfront.net',  // Help Scout's inline image CDN
+  '*.cloudfront.net',                // Other CloudFront-hosted images
+  'cdn.shopify.com',                 // Shopify product images
+  '*.airtableusercontent.com',       // Airtable attachment URLs
+];
+
+function parseAllowlistEnvVar(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+}
+
 export interface Config {
   helpscout: {
     apiKey: string;         // Deprecated: kept for backwards compatibility only
@@ -16,6 +31,7 @@ export interface Config {
   airtable: {
     pat?: string;           // Optional: enables pushAttachmentToAirtable; other tools work without it
   };
+  inlineImageAllowlist: string[]; // Domains whose images getInlineImage will fetch
   cache: {
     ttlSeconds: number;
     maxSize: number;
@@ -47,6 +63,10 @@ export const config: Config = {
   airtable: {
     pat: process.env.AIRTABLE_PAT,
   },
+  inlineImageAllowlist: [
+    ...HARDCODED_INLINE_IMAGE_ALLOWLIST,
+    ...parseAllowlistEnvVar(process.env.INLINE_IMAGE_ALLOWLIST),
+  ],
   cache: {
     ttlSeconds: parseInt(process.env.CACHE_TTL_SECONDS || '300', 10),
     maxSize: parseInt(process.env.MAX_CACHE_SIZE || '10000', 10),
@@ -114,6 +134,15 @@ export function validateConfig(): void {
       timestamp: new Date().toISOString(),
       level: 'warn',
       message: 'AIRTABLE_PAT not set — pushAttachmentToAirtable will return an error if called. Other tools work normally.',
+    }));
+  }
+
+  const customDomains = parseAllowlistEnvVar(process.env.INLINE_IMAGE_ALLOWLIST);
+  if (customDomains.length > 0) {
+    console.error(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      level: 'info',
+      message: `INLINE_IMAGE_ALLOWLIST extended with ${customDomains.length} domain(s): ${customDomains.join(', ')}`,
     }));
   }
 }

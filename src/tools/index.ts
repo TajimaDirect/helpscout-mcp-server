@@ -2,6 +2,8 @@ import { Tool, CallToolRequest, CallToolResult } from '@modelcontextprotocol/sdk
 import sharp from 'sharp';
 import { PaginatedResponse, helpScoutClient } from '../utils/helpscout-client.js';
 import { airtableClient } from '../utils/airtable-client.js';
+import { rasterizePdf } from '../utils/pdf-rasterizer.js';
+import { fetchInlineImage } from '../utils/inline-image-fetcher.js';
 import { createMcpToolError, isApiError } from '../utils/mcp-errors.js';
 import { HelpScoutAPIConstraints, ToolCallContext } from '../utils/api-constraints.js';
 import { logger } from '../utils/logger.js';
@@ -35,6 +37,8 @@ import {
   AssignConversationInputSchema,
   GetSavedRepliesInputSchema,
   GetAttachmentFileInputSchema,
+  GetPdfAsImagesInputSchema,
+  GetInlineImageInputSchema,
   PushAttachmentToAirtableInputSchema,
   GetOrganizationMembersInputSchema,
   GetOrganizationConversationsInputSchema,
@@ -624,7 +628,7 @@ export class ToolHandler {
       },
       {
         name: 'getAttachmentFile',
-        description: 'Fetch the contents of a Help Scout attachment. Use AFTER getThreads — that response provides each attachment\'s id, conversationId, and mimeType (mimeType is required since the /data endpoint doesn\'t return it). For images, the file renders inline so Claude can view it natively. Large images are automatically resized to fit under the MCP protocol size limit while preserving readability — small images and PNG screenshots pass through unchanged. PNG-format inputs are preserved as PNG when possible (better for screenshots and rendered text); JPEG/HEIC inputs may be re-encoded as JPEG. The tool tries multiple resize tiers (2048px high quality → 1600px moderate quality) before failing. Non-image attachments (PDF, etc.) are returned as resource blocks without modification. Files that still exceed the limit after resize return an error.',
+        description: 'Fetch the contents of a Help Scout attachment. Use AFTER getThreads — that response provides each attachment\'s id, conversationId, and mimeType. For images, the file renders inline so Claude can view it natively. PDFs are auto-rasterized to images (first 5 pages, 200 DPI) so they\'re visually viewable in chat. For multi-page PDFs needing page-range control, use getPdfAsImages instead. Large images are automatically resized to fit under the MCP protocol size limit (small images and PNG screenshots pass through unchanged). PNG-format inputs are preserved as PNG when possible. Non-image, non-PDF attachments are returned as resource blocks.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -646,7 +650,7 @@ export class ToolHandler {
       },
       {
         name: 'pushAttachmentToAirtable',
-        description: 'Copy a Help Scout attachment directly into an Airtable attachment field. Use AFTER getThreads to obtain the conversationId, attachmentId, filename, and mimeType. The tool fetches the attachment from Help Scout (auth-walled, not URL-accessible), then uploads it to the specified Airtable record/field. Files under 5MB are uploaded as-is to preserve original quality. Files over 5MB are auto-compressed via sharp (target 4MB, max edge 3000px, JPEG q92) — original quality is preserved when possible. Use field IDs (not field names) for the destination to avoid breakage from field renames. Common use cases: archiving customer return photos, Rx images, frame issue photos, fit complaint photos. Generic — works for any Help Scout attachment to any attachment field on any table in the configured Airtable base.',
+        description: 'Copy a Help Scout attachment directly into an Airtable attachment field. Use AFTER getThreads to obtain the conversationId, attachmentId, filename, and mimeType. The tool fetches the attachment from Help Scout (auth-walled, not URL-accessible), then uploads it to the specified Airtable record/field. Files under 5MB are uploaded as-is to preserve original quality. Files over 5MB are auto-compressed via sharp (target 4MB, max edge 3000px, JPEG q92) — original quality is preserved when possible. Use field IDs (not field names) for the destination to avoid breakage from field renames. For PDFs: by default, the PDF is uploaded as-is. Set rasterizePdfPages: true to instead rasterize each page to a separate image and upload them as multiple attachments to the same field — useful when you want pages browsable as images in Airtable. Common use cases: archiving customer return photos, Rx images, frame issue photos, fit complaint photos.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -678,8 +682,38 @@ export class ToolHandler {
               type: 'string',
               description: 'Airtable attachment field ID (starts with "fld"). Use field IDs not names to avoid breakage. The Airtable upload endpoint appends to existing attachments natively — no replace mode.',
             },
+            rasterizePdfPages: {
+              type: 'boolean',
+              description: 'Optional. Only meaningful when contentType is application/pdf. If true, rasterize each page of the PDF to a separate image and upload them as separate Airtable attachments to the same field. Pages browse as images in Airtable rather than requiring a PDF viewer. Ignored for non-PDF attachments.',
+            },
           },
           required: ['conversationId', 'attachmentId', 'filename', 'contentType', 'baseId', 'recordId', 'fieldId'],
+        },
+      },
+      {
+        name: 'getPdfAsImages',
+        description: 'Fetch a Help Scout PDF attachment and rasterize a specific page range to images. Use this instead of getAttachmentFile when you need to see specific pages of a multi-page PDF (e.g., page 3-7 of a long document) or want a higher DPI than the default. For typical 1-2 page PDFs, getAttachmentFile auto-rasterizes the first 5 pages and is simpler. Returns each requested page as a separate image content block plus a header summary text block.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            conversationId: { type: 'string', description: 'Help Scout conversation ID containing the PDF.' },
+            attachmentId: { type: 'string', description: 'Help Scout attachment ID of the PDF (from getThreads).' },
+            startPage: { type: 'number', description: 'First page to render (1-indexed, default 1).' },
+            endPage: { type: 'number', description: 'Last page to render (1-indexed, inclusive, default startPage+4).' },
+            dpi: { type: 'number', description: 'Render DPI (72-400, default 200). Higher = sharper but bigger files.' },
+          },
+          required: ['conversationId', 'attachmentId'],
+        },
+      },
+      {
+        name: 'getInlineImage',
+        description: 'Fetch an image from a public HTTPS URL and return it as an inline image content block. Designed for Help Scout inline CDN images (the d33v4339jhl8k0.cloudfront.net URLs found in email body HTML), but works for any image URL on the configured allowlist. The default allowlist covers Help Scout, Shopify, Airtable, and CloudFront. Additional domains can be added via INLINE_IMAGE_ALLOWLIST env var. Refuses non-HTTPS URLs, refuses URLs that resolve to private IP addresses (SSRF protection), and refuses URLs not on the allowlist.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            url: { type: 'string', description: 'Full HTTPS URL of the image to fetch.' },
+          },
+          required: ['url'],
         },
       },
     ];
@@ -808,6 +842,12 @@ export class ToolHandler {
           break;
         case 'pushAttachmentToAirtable':
           result = await this.pushAttachmentToAirtable(request.params.arguments || {});
+          break;
+        case 'getPdfAsImages':
+          result = await this.getPdfAsImages(request.params.arguments || {});
+          break;
+        case 'getInlineImage':
+          result = await this.getInlineImage(request.params.arguments || {});
           break;
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
@@ -2462,6 +2502,27 @@ export class ToolHandler {
 
       const rawBuffer = Buffer.from(response.data, 'base64');
 
+      if (input.mimeType === 'application/pdf') {
+        const DEFAULT_PAGE_CAP = 5;
+        const rasterizeResult = await rasterizePdf(rawBuffer, {
+          startPage: 1,
+          endPage: DEFAULT_PAGE_CAP,
+        });
+
+        const blocks = await this.buildPdfPageContentBlocks(rasterizeResult.pages);
+
+        const headerText = rasterizeResult.pagesSkipped > 0
+          ? `PDF rendered as ${rasterizeResult.pagesReturned} page image(s). PDF has ${rasterizeResult.totalPagesInPdf} total pages — only the first ${DEFAULT_PAGE_CAP} were rasterized. Use getPdfAsImages with explicit page range to see additional pages.`
+          : `PDF rendered as ${rasterizeResult.pagesReturned} page image(s).`;
+
+        return {
+          content: [
+            { type: 'text', text: headerText },
+            ...blocks,
+          ],
+        };
+      }
+
       if (input.mimeType.startsWith('image/')) {
         const {
           data: finalBuffer,
@@ -2555,6 +2616,129 @@ export class ToolHandler {
     }
   }
 
+  private async buildPdfPageContentBlocks(
+    pages: Array<{ pageNumber: number; pngBuffer: Buffer }>
+  ): Promise<Array<{ type: 'image'; data: string; mimeType: string } | { type: 'text'; text: string }>> {
+    const MAX_BASE64_BYTES = 750_000;
+    const blocks: Array<{ type: 'image'; data: string; mimeType: string } | { type: 'text'; text: string }> = [];
+    for (const page of pages) {
+      const resized = await this.resizeImageForResponse(page.pngBuffer, 'image/png');
+      const finalBase64 = resized.data.toString('base64');
+      if (finalBase64.length > MAX_BASE64_BYTES) {
+        blocks.push({
+          type: 'text',
+          text: `[Page ${page.pageNumber} too large to render even after resize — skipped.]`,
+        });
+        continue;
+      }
+      blocks.push({
+        type: 'image',
+        data: finalBase64,
+        mimeType: resized.mimeType,
+      });
+    }
+    return blocks;
+  }
+
+  private async getPdfAsImages(args: unknown): Promise<CallToolResult> {
+    const input = GetPdfAsImagesInputSchema.parse(args);
+
+    try {
+      const hsResponse = await helpScoutClient.get<{ data: string }>(
+        `/conversations/${input.conversationId}/attachments/${input.attachmentId}/data`,
+        undefined,
+        { ttl: 0 }
+      );
+
+      const pdfBuffer = Buffer.from(hsResponse.data, 'base64');
+
+      const rasterizeResult = await rasterizePdf(pdfBuffer, {
+        startPage: input.startPage,
+        endPage: input.endPage,
+        dpi: input.dpi,
+      });
+
+      const blocks = await this.buildPdfPageContentBlocks(rasterizeResult.pages);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Rendered ${rasterizeResult.pagesReturned} page(s) at ${input.dpi ?? 200} DPI. PDF total pages: ${rasterizeResult.totalPagesInPdf}.`,
+          },
+          ...blocks,
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: 'pdf_rasterize_failed',
+              conversationId: input.conversationId,
+              attachmentId: input.attachmentId,
+              message,
+            }, null, 2),
+          },
+        ],
+      };
+    }
+  }
+
+  private async getInlineImage(args: unknown): Promise<CallToolResult> {
+    const input = GetInlineImageInputSchema.parse(args);
+
+    try {
+      const { data, contentType } = await fetchInlineImage(input.url);
+
+      const resized = await this.resizeImageForResponse(data, contentType);
+      const finalBase64 = resized.data.toString('base64');
+
+      if (finalBase64.length > 750_000) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                error: 'image_too_large',
+                originalSize: data.length,
+                resizedSize: finalBase64.length,
+                url: input.url,
+                message: 'Image exceeded MCP protocol size limit even after adaptive resize.',
+              }, null, 2),
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: 'image',
+            data: finalBase64,
+            mimeType: resized.mimeType,
+          },
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: 'inline_image_fetch_failed',
+              url: input.url,
+              message,
+            }, null, 2),
+          },
+        ],
+      };
+    }
+  }
+
   private async pushAttachmentToAirtable(args: unknown): Promise<CallToolResult> {
     const input = PushAttachmentToAirtableInputSchema.parse(args);
 
@@ -2572,6 +2756,77 @@ export class ToolHandler {
 
       const originalBuffer = Buffer.from(hsResponse.data, 'base64');
       const originalSize = originalBuffer.length;
+
+      if (input.rasterizePdfPages && input.contentType === 'application/pdf') {
+        const rasterizeResult = await rasterizePdf(originalBuffer, { startPage: 1, endPage: 100 });
+        const baseFilename = input.filename.replace(/\.pdf$/i, '');
+        const uploadedAttachments: Array<{ pageNumber: number; airtableRecordId: string; sizeBytes: number }> = [];
+        const errors: Array<{ pageNumber: number; error: string }> = [];
+
+        for (const page of rasterizeResult.pages) {
+          try {
+            let pageBuffer: Buffer = page.pngBuffer;
+            let pageContentType = 'image/png';
+
+            if (pageBuffer.length > AIRTABLE_MAX_BYTES) {
+              pageBuffer = await sharp(page.pngBuffer)
+                .resize({
+                  width: COMPRESS_MAX_EDGE,
+                  height: COMPRESS_MAX_EDGE,
+                  fit: 'inside',
+                  withoutEnlargement: true,
+                })
+                .jpeg({ quality: COMPRESS_QUALITY })
+                .toBuffer();
+              pageContentType = 'image/jpeg';
+            }
+
+            const finalFilename = pageContentType === 'image/jpeg'
+              ? `${baseFilename}-page${page.pageNumber}.jpg`
+              : `${baseFilename}-page${page.pageNumber}.png`;
+
+            const airtableResponse = await airtableClient.uploadAttachment({
+              baseId: input.baseId,
+              recordId: input.recordId,
+              fieldId: input.fieldId,
+              filename: finalFilename,
+              contentType: pageContentType,
+              base64: pageBuffer.toString('base64'),
+            });
+
+            uploadedAttachments.push({
+              pageNumber: page.pageNumber,
+              airtableRecordId: airtableResponse.id,
+              sizeBytes: pageBuffer.length,
+            });
+          } catch (error: unknown) {
+            errors.push({
+              pageNumber: page.pageNumber,
+              error: error instanceof Error ? error.message : 'unknown',
+            });
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                success: errors.length === 0,
+                mode: 'rasterized',
+                baseId: input.baseId,
+                fieldId: input.fieldId,
+                totalPagesInPdf: rasterizeResult.totalPagesInPdf,
+                pagesUploaded: uploadedAttachments.length,
+                pagesFailed: errors.length,
+                uploads: uploadedAttachments,
+                errors: errors.length > 0 ? errors : undefined,
+                message: `Rasterized PDF and uploaded ${uploadedAttachments.length} page(s) as separate attachments.`,
+              }, null, 2),
+            },
+          ],
+        };
+      }
 
       let uploadBuffer = originalBuffer;
       let uploadContentType = input.contentType;

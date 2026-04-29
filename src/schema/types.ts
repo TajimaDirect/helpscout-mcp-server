@@ -308,6 +308,19 @@ export const PushAttachmentToAirtableInputSchema = z.object({
   baseId: z.string().regex(/^app[a-zA-Z0-9]+$/, 'Airtable base ID must start with "app"'),
   recordId: z.string().regex(/^rec[a-zA-Z0-9]+$/, 'Airtable record ID must start with "rec"'),
   fieldId: z.string().regex(/^fld[a-zA-Z0-9]+$/, 'Airtable field ID must start with "fld" — use field IDs not names to avoid breakage from renames'),
+  rasterizePdfPages: z.boolean().optional(),
+});
+
+export const GetPdfAsImagesInputSchema = z.object({
+  conversationId: z.string().regex(/^\d+$/, 'Conversation ID must be numeric'),
+  attachmentId: z.string().regex(/^\d+$/, 'Attachment ID must be numeric'),
+  startPage: z.number().int().min(1).optional(),
+  endPage: z.number().int().min(1).optional(),
+  dpi: z.number().int().min(72).max(400).optional(),
+});
+
+export const GetInlineImageInputSchema = z.object({
+  url: z.string().url('Must be a valid URL'),
 });
 
 // Response Types

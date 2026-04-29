@@ -42,7 +42,7 @@ describe('ToolHandler', () => {
     it('should return all available tools', async () => {
       const tools = await toolHandler.listTools();
       
-      expect(tools).toHaveLength(23);
+      expect(tools).toHaveLength(25);
       expect(tools.map(t => t.name)).toEqual([
         'searchInboxes',
         'searchConversations',
@@ -67,6 +67,8 @@ describe('ToolHandler', () => {
         'getSavedReplies',
         'getAttachmentFile',
         'pushAttachmentToAirtable',
+        'getPdfAsImages',
+        'getInlineImage',
       ]);
     });
 
@@ -2278,15 +2280,15 @@ describe('ToolHandler', () => {
       resizeSpy.mockRestore();
     });
 
-    it('returns resource block + text metadata for non-image mimeType', async () => {
-      const pdfBase64 = Buffer.from('%PDF-1.4 fake').toString('base64');
-      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: pdfBase64 } as never);
+    it('returns resource block + text metadata for non-image, non-PDF mimeType', async () => {
+      const zipBase64 = Buffer.from('PK fake-zip-bytes').toString('base64');
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: zipBase64 } as never);
 
       const request: CallToolRequest = {
         method: 'tools/call',
         params: {
           name: 'getAttachmentFile',
-          arguments: { conversationId: '123', attachmentId: '789', mimeType: 'application/pdf' },
+          arguments: { conversationId: '123', attachmentId: '789', mimeType: 'application/zip' },
         },
       };
 
@@ -2298,13 +2300,59 @@ describe('ToolHandler', () => {
       };
       expect(resourceBlock.type).toBe('resource');
       expect(resourceBlock.resource.uri).toBe('helpscout://conversations/123/attachments/789');
-      expect(resourceBlock.resource.mimeType).toBe('application/pdf');
-      expect(resourceBlock.resource.blob).toBe(pdfBase64);
+      expect(resourceBlock.resource.mimeType).toBe('application/zip');
+      expect(resourceBlock.resource.blob).toBe(zipBase64);
       const textBlock = result.content[1] as { type: 'text'; text: string };
       expect(textBlock.type).toBe('text');
-      expect(textBlock.text).toContain('application/pdf');
+      expect(textBlock.text).toContain('application/zip');
 
       getSpy.mockRestore();
+    });
+
+    it('auto-rasterizes PDF mimeType into image content blocks', async () => {
+      const fakePdfBase64 = Buffer.from('%PDF-fake').toString('base64');
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: fakePdfBase64 } as never);
+
+      const fakePngPage = await sharp({
+        create: { width: 200, height: 200, channels: 3, background: { r: 255, g: 255, b: 255 } },
+      })
+        .png()
+        .toBuffer();
+
+      const rasterizerModule = await import('../utils/pdf-rasterizer.js');
+      const rasterizeSpy = jest
+        .spyOn(rasterizerModule, 'rasterizePdf')
+        .mockResolvedValue({
+          pages: [
+            { pageNumber: 1, pngBuffer: fakePngPage, width: 200, height: 200 },
+            { pageNumber: 2, pngBuffer: fakePngPage, width: 200, height: 200 },
+          ],
+          totalPagesInPdf: 7,
+          pagesReturned: 2,
+          pagesSkipped: 5,
+        } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getAttachmentFile',
+          arguments: { conversationId: '123', attachmentId: '456', mimeType: 'application/pdf' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+
+      expect(rasterizeSpy).toHaveBeenCalledWith(expect.any(Buffer), { startPage: 1, endPage: 5 });
+      expect(result.content[0]).toMatchObject({ type: 'text' });
+      const headerText = (result.content[0] as { text: string }).text;
+      expect(headerText).toContain('PDF rendered as 2 page image(s)');
+      expect(headerText).toContain('PDF has 7 total pages');
+      expect(result.content).toHaveLength(3);
+      expect(result.content[1]).toMatchObject({ type: 'image', mimeType: 'image/png' });
+      expect(result.content[2]).toMatchObject({ type: 'image', mimeType: 'image/png' });
+
+      getSpy.mockRestore();
+      rasterizeSpy.mockRestore();
     });
 
     it('returns structured error block when fetch fails', async () => {
@@ -2667,6 +2715,308 @@ describe('ToolHandler', () => {
 
       getSpy.mockRestore();
       uploadSpy.mockRestore();
+    });
+
+    it('with rasterizePdfPages true on a PDF, uploads each page as a separate Airtable attachment', async () => {
+      const fakePdfBase64 = Buffer.from('%PDF-fake').toString('base64');
+      const fakePngPage = await sharp({
+        create: { width: 100, height: 100, channels: 3, background: { r: 200, g: 200, b: 200 } },
+      })
+        .png()
+        .toBuffer();
+
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: fakePdfBase64 } as never);
+
+      const rasterizerModule = await import('../utils/pdf-rasterizer.js');
+      const rasterizeSpy = jest
+        .spyOn(rasterizerModule, 'rasterizePdf')
+        .mockResolvedValue({
+          pages: [
+            { pageNumber: 1, pngBuffer: fakePngPage, width: 100, height: 100 },
+            { pageNumber: 2, pngBuffer: fakePngPage, width: 100, height: 100 },
+            { pageNumber: 3, pngBuffer: fakePngPage, width: 100, height: 100 },
+          ],
+          totalPagesInPdf: 3,
+          pagesReturned: 3,
+          pagesSkipped: 0,
+        } as never);
+
+      const uploadSpy = jest
+        .spyOn(airtableClient, 'uploadAttachment')
+        .mockResolvedValueOnce({ id: 'recPAGE1', createdTime: 't', fields: {} } as never)
+        .mockResolvedValueOnce({ id: 'recPAGE2', createdTime: 't', fields: {} } as never)
+        .mockResolvedValueOnce({ id: 'recPAGE3', createdTime: 't', fields: {} } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'pushAttachmentToAirtable',
+          arguments: {
+            ...baseArgs,
+            filename: 'rx.pdf',
+            contentType: 'application/pdf',
+            rasterizePdfPages: true,
+          },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.success).toBe(true);
+      expect(payload.mode).toBe('rasterized');
+      expect(payload.pagesUploaded).toBe(3);
+      expect(payload.pagesFailed).toBe(0);
+      expect(payload.uploads).toHaveLength(3);
+      expect(payload.uploads[0]).toMatchObject({ pageNumber: 1, airtableRecordId: 'recPAGE1' });
+      expect(uploadSpy).toHaveBeenCalledTimes(3);
+      expect(uploadSpy.mock.calls[0]?.[0].filename).toBe('rx-page1.png');
+      expect(uploadSpy.mock.calls[1]?.[0].filename).toBe('rx-page2.png');
+      expect(uploadSpy.mock.calls[2]?.[0].filename).toBe('rx-page3.png');
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+      rasterizeSpy.mockRestore();
+    });
+
+    it('with rasterizePdfPages true on a non-PDF, ignores the option and falls back to normal push', async () => {
+      const getSpy = jest
+        .spyOn(helpScoutClient, 'get')
+        .mockResolvedValue({ data: smallJpeg.toString('base64') } as never);
+      const uploadSpy = jest
+        .spyOn(airtableClient, 'uploadAttachment')
+        .mockResolvedValue({ id: 'recIGNORED', createdTime: 't', fields: {} } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'pushAttachmentToAirtable',
+          arguments: { ...baseArgs, rasterizePdfPages: true }, // contentType is image/jpeg
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.success).toBe(true);
+      expect(payload.mode).toBeUndefined();
+      expect(payload.airtableRecordId).toBe('recIGNORED');
+      expect(uploadSpy).toHaveBeenCalledTimes(1);
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+    });
+
+    it('rasterized push reports per-page errors when individual page uploads fail', async () => {
+      const fakePdfBase64 = Buffer.from('%PDF-fake').toString('base64');
+      const fakePngPage = await sharp({
+        create: { width: 100, height: 100, channels: 3, background: { r: 0, g: 0, b: 0 } },
+      })
+        .png()
+        .toBuffer();
+
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: fakePdfBase64 } as never);
+
+      const rasterizerModule = await import('../utils/pdf-rasterizer.js');
+      const rasterizeSpy = jest
+        .spyOn(rasterizerModule, 'rasterizePdf')
+        .mockResolvedValue({
+          pages: [
+            { pageNumber: 1, pngBuffer: fakePngPage, width: 100, height: 100 },
+            { pageNumber: 2, pngBuffer: fakePngPage, width: 100, height: 100 },
+          ],
+          totalPagesInPdf: 2,
+          pagesReturned: 2,
+          pagesSkipped: 0,
+        } as never);
+
+      const uploadSpy = jest
+        .spyOn(airtableClient, 'uploadAttachment')
+        .mockResolvedValueOnce({ id: 'recPAGE1', createdTime: 't', fields: {} } as never)
+        .mockRejectedValueOnce(new Error('Airtable upload failed (422): {"message":"Invalid field"}'));
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'pushAttachmentToAirtable',
+          arguments: {
+            ...baseArgs,
+            filename: 'doc.pdf',
+            contentType: 'application/pdf',
+            rasterizePdfPages: true,
+          },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.success).toBe(false);
+      expect(payload.pagesUploaded).toBe(1);
+      expect(payload.pagesFailed).toBe(1);
+      expect(payload.errors).toHaveLength(1);
+      expect(payload.errors[0]).toMatchObject({ pageNumber: 2 });
+      expect(payload.errors[0].error).toContain('Invalid field');
+
+      getSpy.mockRestore();
+      uploadSpy.mockRestore();
+      rasterizeSpy.mockRestore();
+    });
+  });
+
+  describe('getPdfAsImages', () => {
+    it('rasterizes the requested page range and returns image blocks + header text', async () => {
+      const fakePdfBase64 = Buffer.from('%PDF-fake').toString('base64');
+      const fakePngPage = await sharp({
+        create: { width: 200, height: 200, channels: 3, background: { r: 100, g: 100, b: 100 } },
+      })
+        .png()
+        .toBuffer();
+
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: fakePdfBase64 } as never);
+      const rasterizerModule = await import('../utils/pdf-rasterizer.js');
+      const rasterizeSpy = jest
+        .spyOn(rasterizerModule, 'rasterizePdf')
+        .mockResolvedValue({
+          pages: [
+            { pageNumber: 3, pngBuffer: fakePngPage, width: 200, height: 200 },
+            { pageNumber: 4, pngBuffer: fakePngPage, width: 200, height: 200 },
+          ],
+          totalPagesInPdf: 10,
+          pagesReturned: 2,
+          pagesSkipped: 8,
+        } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getPdfAsImages',
+          arguments: {
+            conversationId: '123',
+            attachmentId: '456',
+            startPage: 3,
+            endPage: 4,
+            dpi: 300,
+          },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+
+      expect(rasterizeSpy).toHaveBeenCalledWith(expect.any(Buffer), { startPage: 3, endPage: 4, dpi: 300 });
+      const headerText = (result.content[0] as { text: string }).text;
+      expect(headerText).toContain('Rendered 2 page(s) at 300 DPI');
+      expect(headerText).toContain('PDF total pages: 10');
+      expect(result.content).toHaveLength(3);
+      expect(result.content[1]).toMatchObject({ type: 'image', mimeType: 'image/png' });
+      expect(result.content[2]).toMatchObject({ type: 'image', mimeType: 'image/png' });
+
+      getSpy.mockRestore();
+      rasterizeSpy.mockRestore();
+    });
+
+    it('returns pdf_rasterize_failed error block when rasterization throws', async () => {
+      const fakePdfBase64 = Buffer.from('%PDF-fake').toString('base64');
+      const getSpy = jest.spyOn(helpScoutClient, 'get').mockResolvedValue({ data: fakePdfBase64 } as never);
+
+      const rasterizerModule = await import('../utils/pdf-rasterizer.js');
+      const rasterizeSpy = jest
+        .spyOn(rasterizerModule, 'rasterizePdf')
+        .mockRejectedValue(new Error('Invalid PDF: header not found'));
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getPdfAsImages',
+          arguments: { conversationId: '123', attachmentId: '456' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.error).toBe('pdf_rasterize_failed');
+      expect(payload.message).toContain('Invalid PDF');
+
+      getSpy.mockRestore();
+      rasterizeSpy.mockRestore();
+    });
+  });
+
+  describe('getInlineImage', () => {
+    it('fetches an allowed URL, resizes if needed, and returns image content block', async () => {
+      const smallJpegLocal = await sharp({
+        create: { width: 50, height: 50, channels: 3, background: { r: 255, g: 0, b: 0 } },
+      })
+        .jpeg()
+        .toBuffer();
+
+      const fetcherModule = await import('../utils/inline-image-fetcher.js');
+      const fetchSpy = jest
+        .spyOn(fetcherModule, 'fetchInlineImage')
+        .mockResolvedValue({ data: smallJpegLocal, contentType: 'image/jpeg' } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: {
+          name: 'getInlineImage',
+          arguments: { url: 'https://d33v4339jhl8k0.cloudfront.net/inline/test.jpg' },
+        },
+      };
+
+      const result = await toolHandler.callTool(request);
+      expect(fetchSpy).toHaveBeenCalledWith('https://d33v4339jhl8k0.cloudfront.net/inline/test.jpg');
+      const block = result.content[0] as { type: string; mimeType: string };
+      expect(block.type).toBe('image');
+      expect(block.mimeType).toBe('image/jpeg');
+
+      fetchSpy.mockRestore();
+    });
+
+    it('surfaces allowlist rejection from the fetcher as inline_image_fetch_failed', async () => {
+      const fetcherModule = await import('../utils/inline-image-fetcher.js');
+      const fetchSpy = jest
+        .spyOn(fetcherModule, 'fetchInlineImage')
+        .mockRejectedValue(new Error('Hostname "evil.example.com" is not in the inline image allowlist.'));
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: { name: 'getInlineImage', arguments: { url: 'https://evil.example.com/x.jpg' } },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.error).toBe('inline_image_fetch_failed');
+      expect(payload.message).toContain('not in the inline image allowlist');
+
+      fetchSpy.mockRestore();
+    });
+
+    it('returns image_too_large when the image exceeds the protocol cap after resize', async () => {
+      const fetcherModule = await import('../utils/inline-image-fetcher.js');
+      const fetchSpy = jest
+        .spyOn(fetcherModule, 'fetchInlineImage')
+        .mockResolvedValue({ data: Buffer.from('fake'), contentType: 'image/jpeg' } as never);
+
+      const oversizeBuffer = Buffer.alloc(800_000);
+      const resizeSpy = jest
+        .spyOn(toolHandler as unknown as { resizeImageForResponse: ToolHandler['callTool'] }, 'resizeImageForResponse')
+        .mockResolvedValue({ data: oversizeBuffer, mimeType: 'image/jpeg' } as never);
+
+      const request: CallToolRequest = {
+        method: 'tools/call',
+        params: { name: 'getInlineImage', arguments: { url: 'https://d33v4339jhl8k0.cloudfront.net/big.jpg' } },
+      };
+
+      const result = await toolHandler.callTool(request);
+      const payload = JSON.parse((result.content[0] as { type: 'text'; text: string }).text);
+
+      expect(payload.error).toBe('image_too_large');
+      expect(payload.url).toBe('https://d33v4339jhl8k0.cloudfront.net/big.jpg');
+
+      fetchSpy.mockRestore();
+      resizeSpy.mockRestore();
     });
   });
 });

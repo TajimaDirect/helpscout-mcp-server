@@ -72,6 +72,7 @@
     "axios": "^1.6.2",
     "dotenv": "^16.3.1",
     "lru-cache": "^10.1.0",
+    "pdf-to-png-converter": "^4.0.0",
     "sharp": "^0.34.5",
     "zod": "^3.22.4"
   },
